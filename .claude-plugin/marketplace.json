@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Claude Code plugins for Workhorse-powered delegation",
-    "version": "0.1.0"
+    "version": "0.2.0"
   },
   "plugins": [
     {
       "name": "wh-delegate",
       "description": "Delegate tasks from Claude Code to opencode running on Workhorse inference",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": {
         "name": "more-horsepower"
       },

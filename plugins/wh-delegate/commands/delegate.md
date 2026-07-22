@@ -8,7 +8,7 @@ Delegate the following task to Workhorse (opencode running on Workhorse inferenc
 Task:
 $ARGUMENTS
 
-Use the `wh-delegate` subagent to forward this task. The subagent will make a single Bash call to the companion script, which spawns `opencode run` with the task prompt.
+Use the `wh-delegate` subagent to forward this task. The subagent will make a single Bash call to `opencode run` directly.
 
 If the user specified `--model <provider/model>`, pass it through. Otherwise use the workhorse default.
 

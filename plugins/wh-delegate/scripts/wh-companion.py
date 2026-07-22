@@ -1,41 +1,15 @@
 #!/usr/bin/env python3
-"""Workhorse delegate companion script.
+"""Workhorse delegate setup script.
 
-Bridge between Claude Code and opencode running on Workhorse inference.
-Shells out to `opencode run` (headless mode) which runs a full agent loop
-locally using Workhorse inference via the localhost proxy.
-
-Subcommands:
-  task    Delegate a task to opencode on Workhorse inference
-  setup   Verify wh, opencode, proxy, and providers are ready
-
-Usage:
-  python wh-companion.py task "fix the flaky test"
-  python wh-companion.py task --model workhorse-proxy/qwen36-35b-a3b-q4-par1 "refactor auth"
-  python wh-companion.py setup
+Verify environment readiness for opencode delegation on Workhorse inference.
 """
 
-from __future__ import annotations
-
-import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-
-# --- Constants ---
-
-DEFAULT_MODEL = os.environ.get("WH_DELEGATE_DEFAULT_MODEL", "workhorse-proxy/default")
-DEFAULT_TIMEOUT = int(os.environ.get("WH_DELEGATE_TIMEOUT", "600"))
-WH_MANAGED_OPENCODE_DIR = Path.home() / ".opencode-wh" / "bin"
-WH_PROXY_PORT = 11969
-
-# opencode run --format json emits newline-delimited JSON objects.
-# Each object has a "type" field. We want the final assistant message.
-# Types observed: session.updated, message.updated, message.part, etc.
-# The final assistant message text is in the last message with role "assistant".
 
 # --- Helpers ---
 
@@ -87,34 +61,25 @@ def find_opencode_binary() -> tuple[str | None, str | None]:
     Returns (path, version) or (None, None) if not found.
 
     Preference order:
-    1. Explicit override via WH_DELEGATE_OPENCODE_BIN
-    2. System opencode on PATH (typically the latest, avoids wh-managed bugs)
-    3. wh-managed opencode at ~/.opencode-wh/bin/ (pinned by wh CLI)
+    1. System opencode on PATH (typically the latest, avoids wh-managed bugs)
+    2. wh-managed opencode at ~/.opencode-wh/bin/ (pinned by wh CLI)
 
-    The wh-managed version can lag behind and may have bugs (e.g. 1.15.5 has a
-    SQLite session_message.seq NOT NULL bug). System opencode is preferred when
-    available and newer.
+    The wh-managed version can lag behind and may have bugs. System opencode is
+    preferred when available.
     """
     candidates: list[tuple[str, str]] = []
 
-    # 1. Explicit override via env var
-    env_bin = os.environ.get("WH_DELEGATE_OPENCODE_BIN")
-    if env_bin and shutil.which(env_bin):
-        ver = get_opencode_version(env_bin)
-        if ver:
-            candidates.append((env_bin, ver))
-
-    # 2. System opencode on PATH (preferred — typically latest)
+    # 1. System opencode on PATH (preferred — typically latest)
     system_bin = shutil.which("opencode")
     if system_bin:
         ver = get_opencode_version(system_bin)
         if ver:
             candidates.append((system_bin, ver))
 
-    # 3. wh-managed opencode (pinned version, installed by wh spectate/attach)
+    # 2. wh-managed opencode (pinned version, installed by wh spectate/attach)
     for candidate in [
-        WH_MANAGED_OPENCODE_DIR / "opencode",
-        WH_MANAGED_OPENCODE_DIR / "opencode.cmd",
+        Path.home() / ".opencode-wh" / "bin" / "opencode",
+        Path.home() / ".opencode-wh" / "opencode",
     ]:
         if candidate.exists() and os.access(candidate, os.X_OK):
             ver = get_opencode_version(str(candidate))
@@ -156,10 +121,10 @@ def check_proxy_running(wh_bin: str) -> tuple[bool, str]:
     result = run_command([wh_bin, "proxy"], timeout=15)
     output = result.stdout + result.stderr
     if result.returncode == 0 and "Proxy running" in output:
-        # Extract base_url if present
         url_match = re.search(r"base_url:\s*(\S+)", output)
-        url = url_match.group(1) if url_match else f"http://127.0.0.1:{WH_PROXY_PORT}/v1"
-        return True, url
+        if url_match:
+            return True, url_match.group(1)
+        return True, "running"
     return False, ""
 
 
@@ -266,189 +231,12 @@ def cmd_setup() -> int:
     return 0 if all_ready else 1
 
 
-# --- Task subcommand ---
-
-
-def parse_task_args(argv: list[str]) -> tuple[str | None, str]:
-    """Parse task subcommand arguments.
-
-    Returns (model_override, prompt_text).
-    """
-    model = None
-    prompt_parts: list[str] = []
-
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg in ("--model", "-m"):
-            if i + 1 < len(argv):
-                model = argv[i + 1]
-                i += 2
-            else:
-                die(f"Error: {arg} requires a value")
-        elif arg.startswith("--model="):
-            model = arg[len("--model=") :]
-            i += 1
-        elif arg.startswith("-"):
-            die(f"Error: unknown flag: {arg}")
-        else:
-            prompt_parts.append(arg)
-            i += 1
-
-    prompt = " ".join(prompt_parts).strip()
-    return model, prompt
-
-
-def extract_result_from_json_output(raw_output: str) -> str:
-    """Extract the final assistant message from opencode run --format json output.
-
-    opencode emits newline-delimited JSON events. Each event has a "type" field.
-    The relevant types are:
-
-      {"type": "text", "part": {"type": "text", "text": "...", ...}}
-      {"type": "step_start", "part": {"type": "step-start", ...}}
-      {"type": "step_finish", "part": {"type": "step-finish", ...}}
-      {"type": "tool_start", "part": {"type": "tool-start", ...}}
-      {"type": "tool_finish", "part": {"type": "tool-finish", ...}}
-      {"type": "error", "error": {"name": "...", "data": {"message": "..."}}}
-
-    Assistant text arrives in "text" events. We collect all text parts and
-    return them concatenated (the full assistant response).
-
-    Falls back to raw output if no text events are found.
-    """
-    text_parts: list[str] = []
-
-    for line in raw_output.strip().splitlines():
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        event_type = event.get("type")
-
-        # Text content from the assistant
-        if event_type == "text":
-            part = event.get("part", {})
-            if isinstance(part, dict):
-                text = part.get("text", "")
-                if text:
-                    text_parts.append(text)
-
-        # Error event
-        if event_type == "error":
-            error = event.get("error", {})
-            error_data = error.get("data", {}) if isinstance(error, dict) else {}
-            error_msg = error_data.get("message", "") if isinstance(error_data, dict) else ""
-            if error_msg:
-                text_parts.append(f"[Error from opencode: {error_msg}]")
-
-    if text_parts:
-        return "\n".join(text_parts)
-
-    # Fallback: return raw output (non-JSON or unrecognized format)
-    return raw_output.strip()
-
-
-def cmd_task(argv: list[str]) -> int:
-    """Delegate a task to opencode on Workhorse inference."""
-    model_override, prompt = parse_task_args(argv)
-
-    if not prompt:
-        die(
-            "Error: no task provided.\n"
-            "Usage: wh-companion.py task [--model <provider/model>] <prompt>"
-        )
-
-    # Resolve opencode binary
-    oc_bin, oc_ver = find_opencode_binary()
-    if not oc_bin:
-        die(
-            "Error: opencode not found.\n"
-            "  wh-managed: run 'wh attach <run>' or 'wh spectate' to install\n"
-            "  system: install from https://opencode.ai"
-        )
-
-    # Resolve model
-    model = model_override or DEFAULT_MODEL
-
-    # Resolve working directory
-    cwd = os.getcwd()
-
-    # Quick proxy check (non-fatal — user might be using workhorse-api)
-    wh_bin = find_wh_cli()
-    if wh_bin:
-        proxy_running, _ = check_proxy_running(wh_bin)
-        if not proxy_running and model.startswith("workhorse-proxy"):
-            err("Warning: workhorse proxy is not running. Start it with: wh proxy on")
-            err("  (delegation may fail if the proxy is required for this model)")
-            err()
-
-    # Build opencode command.
-    #
-    # opencode run flags (verified against opencode 1.15+):
-    #   --model <provider/model>     model to use
-    #   --dangerously-skip-permissions  auto-approve all tool calls (headless mode)
-    #   --dir <path>                 working directory
-    #   --format json                newline-delimited JSON event output
-    #
-    # Note: --auto is a global opencode flag (for TUI mode), NOT accepted by
-    # the `run` subcommand. The `run` equivalent is --dangerously-skip-permissions.
-    cmd = [
-        oc_bin,
-        "run",
-        prompt,
-        "--model",
-        model,
-        "--dangerously-skip-permissions",
-        "--dir",
-        cwd,
-        "--format",
-        "json",
-    ]
-
-    # Run opencode
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=DEFAULT_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        die(
-            f"Error: opencode timed out after {DEFAULT_TIMEOUT}s.\n"
-            f"  Set WH_DELEGATE_TIMEOUT to increase the limit."
-        )
-        return 124  # unreachable, die exits
-    except KeyboardInterrupt:
-        die("\nCancelled.")
-        return 130
-
-    if result.returncode != 0:
-        # opencode failed — print stderr and exit
-        if result.stderr:
-            err(result.stderr)
-        die(f"Error: opencode exited with code {result.returncode}")
-
-    # Parse output
-    output = extract_result_from_json_output(result.stdout)
-
-    # Print result to stdout (this is what Claude Code receives)
-    print(output)
-    return 0
-
-
 # --- Main ---
 
 
 def print_usage() -> None:
     print(
         "Usage:\n"
-        "  wh-companion.py task [--model <provider/model>] <prompt>\n"
         "  wh-companion.py setup\n"
     )
 
@@ -459,17 +247,15 @@ def main() -> int:
         return 1
 
     subcommand = sys.argv[1]
-    argv = sys.argv[2:]
 
-    if subcommand == "task":
-        return cmd_task(argv)
-    elif subcommand == "setup":
+    if subcommand == "setup":
         return cmd_setup()
     elif subcommand in ("help", "--help", "-h"):
         print_usage()
         return 0
     else:
         err(f"Unknown subcommand: {subcommand}")
+        err("Only 'setup' is supported. Delegation is handled directly by the subagent via 'opencode run'.")
         print_usage()
         return 1
 
