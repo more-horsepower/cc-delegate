@@ -60,16 +60,14 @@ def find_opencode_binary() -> tuple[str | None, str | None]:
 
     Returns (path, version) or (None, None) if not found.
 
-    Preference order:
-    1. System opencode on PATH (typically the latest, avoids wh-managed bugs)
-    2. wh-managed opencode at ~/.opencode-wh/bin/ (pinned by wh CLI)
-
-    The wh-managed version can lag behind and may have bugs. System opencode is
-    preferred when available.
+    Searches system opencode on PATH and the wh-managed install at
+    ~/.opencode-wh/bin/, then picks the candidate with the highest version.
+    The wh-managed version can lag behind and may have bugs, so the newest
+    available binary wins regardless of source.
     """
     candidates: list[tuple[str, str]] = []
 
-    # 1. System opencode on PATH (preferred — typically latest)
+    # 1. System opencode on PATH
     system_bin = shutil.which("opencode")
     if system_bin:
         ver = get_opencode_version(system_bin)

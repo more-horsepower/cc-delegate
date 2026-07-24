@@ -11,8 +11,10 @@ Use this skill only inside the `wh-delegate` subagent.
 ## Primary Helper
 
 ```bash
-opencode run "<prompt>" --model "${WH_DELEGATE_DEFAULT_MODEL:-workhorse-proxy/default}" --auto --dir "$PWD"
+opencode run '<prompt>' --model "${WH_DELEGATE_DEFAULT_MODEL:-workhorse-proxy/default}" --auto --dir "$PWD"
 ```
+
+Single-quote the prompt so shell metacharacters in the user's task are not interpreted by bash. If the prompt contains a single quote, escape it as `'\''`.
 
 ## Execution Rules
 
@@ -22,7 +24,7 @@ opencode run "<prompt>" --model "${WH_DELEGATE_DEFAULT_MODEL:-workhorse-proxy/de
 - Leave model unset by default (uses `workhorse-proxy/default`). Only add `--model workhorse-proxy/<name>` when the user explicitly asks for a specific model.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Return the stdout exactly as-is — opencode streams human-readable output with `--auto` and default format.
-- If the Bash call fails or opencode cannot be invoked, return nothing.
+- If the Bash call fails or opencode cannot be invoked, return a single line so the user knows delegation did not run: `wh-delegate: opencode invocation failed (<brief reason>)`. Do not swallow the failure silently.
 
 ## Command Selection
 
