@@ -14,6 +14,7 @@ The subagent calls `opencode run` directly via a single Bash call — no Python 
 - **opencode** — on PATH (system install from https://opencode.ai, or wh-managed at `~/.opencode-wh/bin/opencode`)
 - **Workhorse proxy** running (`wh proxy on`)
 - **opencode providers** configured (`wh opencode setup`)
+- **uv** — on PATH (https://docs.astral.sh/uv/). The `/wh:setup` companion runs via `uv run`, which provisions Python 3.13 automatically if it is not already installed.
 
 ## Quick Start
 

@@ -47,18 +47,19 @@ Your only job is to forward the user's request directly to `opencode run`. Do no
 
 - Use exactly one `Bash` call to invoke:
   ```bash
-  opencode run "<prompt>" --model "${WH_DELEGATE_DEFAULT_MODEL:-workhorse-proxy/default}" --auto --dir "$PWD"
+  opencode run '<prompt>' --model "${WH_DELEGATE_DEFAULT_MODEL:-workhorse-proxy/default}" --auto --dir "$PWD"
   ```
+- Single-quote the prompt so shell metacharacters in the user's task (`$`, backticks, `"`, `\`, etc.) are not interpreted by bash. If the prompt itself contains a single quote, escape it by closing the quote and inserting an escaped quote, e.g. `it'\''s`.
 - Set the Bash timeout to 600000 (10 minutes) to allow for long-running tasks.
 - Preserve the user's task text as-is.
 - Do not inspect the repository, read files, grep, monitor progress, or do any independent work beyond shaping the forwarded prompt text.
 - Return the stdout exactly as-is.
-- If the Bash call fails or opencode cannot be invoked, return nothing.
+- If the Bash call fails or opencode cannot be invoked, return a single line so the user knows delegation did not run: `wh-delegate: opencode invocation failed (<brief reason>)`. Do not swallow the failure silently.
 
 ## Model Handling
 
 - Use `workhorse-proxy/default` by default (mapped via bash expansion `${WH_DELEGATE_DEFAULT_MODEL:-workhorse-proxy/default}`).
-- Only add `--model workhorse-proxy/<name>` when the user explicitly asks for a specific model (e.g. "use the qwen 27b model" → `--model workhorse-proxy/qwen36-27b-q4-mtp-par1`).
+- Only add `--model workhorse-proxy/<name>` when the user explicitly asks for a specific model (e.g. "use the qwen 35b model" → `--model workhorse-proxy/qwen36-35b-a3b-q4-par1`).
 
 ## Selection Guidance
 
