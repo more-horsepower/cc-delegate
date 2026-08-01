@@ -1,0 +1,27 @@
+{
+  "description": "Capture the Claude transcript path on session start and clean up tracked opencode jobs on session end.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.py\" SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.py\" SessionEnd",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
