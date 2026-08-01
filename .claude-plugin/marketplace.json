@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "Claude Code plugins for Workhorse-powered delegation",
-    "version": "0.0.1"
+    "version": "0.1.0"
   },
   "license": "MIT",
   "plugins": [
     {
       "name": "wh-delegate",
       "description": "Delegate tasks from Claude Code to opencode running on Workhorse inference",
-      "version": "0.0.1",
+      "version": "0.1.0",
       "author": {
         "name": "more-horsepower"
       },

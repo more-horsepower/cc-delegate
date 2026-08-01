@@ -1,6 +1,6 @@
 {
   "name": "wh-delegate",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Delegate tasks from Claude Code to opencode running on Workhorse inference",
   "author": {
     "name": "more-horsepower"
