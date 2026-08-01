@@ -1,0 +1,4 @@
+{"type":"summary","summary":"A short session"}
+{"type":"system","content":"System prompt"}
+{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-01-01T10:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":"Hi there!","model":"claude-sonnet-4-20250514","usage":{"input_tokens":10,"output_tokens":5},"stop_reason":"end_turn"},"timestamp":"2026-01-01T10:00:01Z"}

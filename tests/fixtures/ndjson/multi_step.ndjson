@@ -1,0 +1,10 @@
+{"type":"session.info","sessionID":"ses_test_006"}
+{"type":"step_start"}
+{"type":"text","part":{"text":"First step."}}
+{"type":"step_finish"}
+{"type":"step_start"}
+{"type":"text","part":{"text":"Second step."}}
+{"type":"step_finish"}
+{"type":"step_start"}
+{"type":"text","part":{"text":"Third step."}}
+{"type":"step_finish"}

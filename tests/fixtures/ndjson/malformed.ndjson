@@ -1,0 +1,4 @@
+not json at all
+{"type":"text","part":{"text":"After bad line"}}
+{bad json
+{"type":"step_finish"}

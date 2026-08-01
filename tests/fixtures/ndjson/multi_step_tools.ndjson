@@ -1,0 +1,13 @@
+{"type":"session.info","sessionID":"ses_test_005"}
+{"type":"step_start"}
+{"type":"tool_use","part":{"tool":"bash","state":{"status":"running","title":"Running tests"}}}
+{"type":"tool_use","part":{"tool":"bash","state":{"status":"error","title":"Running tests"}}}
+{"type":"text","part":{"text":"Tests failed. Investigating..."}}
+{"type":"tool_use","part":{"tool":"read","state":{"status":"running","title":"Reading test file"}}}
+{"type":"tool_use","part":{"tool":"read","state":{"status":"completed","title":"Reading test file"}}}
+{"type":"text","part":{"text":"Found the bug. Applying fix."}}
+{"type":"tool_use","part":{"tool":"write","state":{"status":"completed","title":"Writing fix"}}}
+{"type":"tool_use","part":{"tool":"bash","state":{"status":"running","title":"Re-running tests"}}}
+{"type":"tool_use","part":{"tool":"bash","state":{"status":"completed","title":"Re-running tests"}}}
+{"type":"text","part":{"text":"All tests pass now."}}
+{"type":"step_finish"}

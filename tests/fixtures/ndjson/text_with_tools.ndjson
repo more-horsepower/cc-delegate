@@ -1,0 +1,10 @@
+{"type":"session.info","sessionID":"ses_test_002"}
+{"type":"step_start"}
+{"type":"text","part":{"text":"Let me check the files."}}
+{"type":"tool_use","part":{"tool":"read","state":{"status":"running","title":"Reading main.py"}}}
+{"type":"tool_use","part":{"tool":"read","state":{"status":"completed","title":"Reading main.py"}}}
+{"type":"text","part":{"text":"I found the issue and fixed it."}}
+{"type":"tool_use","part":{"tool":"write","state":{"status":"running","title":"Writing main.py"}}}
+{"type":"tool_use","part":{"tool":"write","state":{"status":"completed","title":"Writing main.py"}}}
+{"type":"text","part":{"text":"The fix has been applied."}}
+{"type":"step_finish"}

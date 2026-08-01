@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":"Fix the flaky integration tests"},"timestamp":"2026-01-01T10:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll investigate the flaky tests."}],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":50},"stop_reason":"end_turn"},"timestamp":"2026-01-01T10:00:01Z"}

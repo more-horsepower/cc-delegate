@@ -1,0 +1,5 @@
+{"type":"session.info","sessionID":"ses_test_004"}
+{"type":"step_start"}
+{"type":"text","part":{"text":"Starting work..."}}
+{"type":"error","error":{"name":"Error","data":{"message":"Model connection failed"}}}
+{"type":"step_finish"}

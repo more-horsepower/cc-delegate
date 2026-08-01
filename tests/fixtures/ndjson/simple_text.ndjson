@@ -1,0 +1,5 @@
+{"type":"session.info","sessionID":"ses_test_001"}
+{"type":"step_start"}
+{"type":"text","part":{"text":"I'll help you with that."}}
+{"type":"text","part":{"text":"Here is the solution."}}
+{"type":"step_finish"}
