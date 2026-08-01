@@ -14,7 +14,7 @@ Use this skill only inside the `wh-delegate` and `wh-rescue` subagents.
 uv run "${CLAUDE_PLUGIN_ROOT}/scripts/wh-companion.py" task "<prompt>"
 ```
 
-The companion spawns `opencode run --format json --auto` and streams the assistant's text output back on stdout.
+The companion runs the turn as `opencode run --attach <broker> --session <id> --format json --auto` against a persistent per-workspace `opencode serve` broker and streams the assistant's text output back on stdout.
 
 ## Execution Rules
 
@@ -49,10 +49,12 @@ The companion spawns `opencode run --format json --auto` and streams the assista
 
 When the companion runs `task`:
 
-1. It resolves the workspace root (git toplevel, or the cwd if not in a repo).
-2. It spawns `opencode run "<prompt>" --model <model> --format json --auto --dir <cwd>` (plus `--session <id>` when resuming), in its own process group so it can be cancelled.
-3. opencode runs locally with full file system access, using Workhorse inference via the localhost proxy.
-4. The companion parses the NDJSON event stream: `step_start`, `tool_use`, `text`, `step_finish`, `error`. It forwards assistant `text` parts to stdout as they complete and records progress in a job log.
-5. The session id (opencode `sessionID`) is captured and stored on the job so it can be resumed later with `--resume`.
+1. It resolves the workspace root (git toplevel, or the cwd if not in a repo) and ensures a persistent `opencode serve` broker is running for that workspace (started on demand; lifecycle-managed by the SessionStart/SessionEnd hooks via per-session leases).
+2. It creates the opencode session up front through the broker API (`POST /session?directory=...`), so every job carries its opencode session id from the start — unless `--resume` continues an existing session.
+3. It spawns `opencode run "<prompt>" --attach <broker-url> --session <id> --model <model> --format json --auto --dir <cwd>`.
+4. opencode runs locally with full file system access, using Workhorse inference via the localhost proxy.
+5. The companion parses the NDJSON event stream: `step_start`, `tool_use`, `text`, `step_finish`, `error`. It forwards assistant `text` parts to stdout as they complete and records progress in a job log. A `MessageAbortedError` event means the turn was cleanly aborted (cancelled), not failed.
+
+Cancellation (`/wh:cancel`, or SessionEnd cleanup) goes through the broker's `POST /session/{id}/abort` API: opencode stops the turn itself, flushes its session database, marks the session idle, and leaves it resumable — the job is recorded as cancelled, never as a crash.
 
 The opencode agent has full read/write access to the workspace. It can read files, write code, run commands — anything a normal coding agent can do.

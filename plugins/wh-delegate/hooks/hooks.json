@@ -18,7 +18,7 @@
           {
             "type": "command",
             "command": "uv run \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.py\" SessionEnd",
-            "timeout": 5
+            "timeout": 15
           }
         ]
       }

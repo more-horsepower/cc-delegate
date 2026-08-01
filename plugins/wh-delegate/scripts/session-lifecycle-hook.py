@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Session lifecycle hook: capture the Claude transcript/session id into the
-Claude env file on SessionStart, and reap tracked opencode jobs on SessionEnd.
+Claude env file on SessionStart, and on SessionEnd cancel this session's
+tracked opencode jobs (via the broker abort API, so turns stop cleanly) and
+stop the workspace broker once the last Claude session lease goes away.
 
 Run via:  uv run session-lifecycle-hook.py SessionStart|SessionEnd
 """
@@ -43,11 +45,27 @@ def load_companion():
     return mod
 
 
-def cleanup_jobs(cwd: str, sid: str) -> None:
+def on_session_start(cwd: str, sid: str) -> None:
     if not cwd or not sid:
         return
     try:
-        load_companion().reap_session_jobs(cwd, sid)
+        load_companion().lease_start(cwd, sid)
+    except Exception:
+        # A lifecycle hook must never crash the host session.
+        pass
+
+
+def on_session_end(cwd: str, sid: str) -> None:
+    if not cwd or not sid:
+        return
+    try:
+        comp = load_companion()
+        # Abort this session's opencode turns through the broker (clean stop,
+        # jobs recorded as cancelled), then drop this session's broker lease
+        # and stop the broker when no Claude session is using it anymore.
+        comp.reap_session_jobs(cwd, sid)
+        if comp.lease_end(cwd, sid) == 0:
+            comp.stop_broker(cwd)
     except Exception:
         # A lifecycle hook must never crash the host session.
         pass
@@ -60,9 +78,10 @@ def main() -> None:
         append_env(SESSION_ID_ENV, data.get("session_id", ""))
         append_env(TRANSCRIPT_PATH_ENV, data.get("transcript_path", ""))
         append_env(PLUGIN_DATA_ENV, os.environ.get(PLUGIN_DATA_ENV, ""))
+        on_session_start(data.get("cwd") or os.getcwd(), data.get("session_id", ""))
     elif event == "SessionEnd":
         data = read_input()
-        cleanup_jobs(data.get("cwd") or os.getcwd(), data.get("session_id") or os.environ.get(SESSION_ID_ENV, ""))
+        on_session_end(data.get("cwd") or os.getcwd(), data.get("session_id") or os.environ.get(SESSION_ID_ENV, ""))
 
 
 if __name__ == "__main__":

@@ -15,10 +15,12 @@ Subcommands:
   status                     list / inspect tracked jobs
   result                     show stored output for a finished job
   cancel                     cancel an active background job
+  broker                     inspect (or stop) the per-workspace opencode broker
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -28,6 +30,9 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 # --- constants ---------------------------------------------------------------
@@ -46,6 +51,9 @@ OPENCODE_WH_DIRS = [
     Path.home() / ".opencode" / "bin",
 ]
 PROJECTS_DIR = (Path.home() / ".claude" / "projects").resolve()
+BROKER_HOSTNAME = "127.0.0.1"
+BROKER_START_TIMEOUT_S = 20
+ABORTED_ERROR = "MessageAbortedError"
 
 # --- tiny helpers ------------------------------------------------------------
 
@@ -177,7 +185,7 @@ def upsert_job(cwd: str, patch: dict) -> None:
     full = {k: v for k, v in patch.items() if k in {
         "id", "kind", "kindLabel", "title", "summary", "workspaceRoot",
         "jobClass", "sessionId", "status", "phase", "pid", "opencodePid",
-        "threadId", "startedAt", "completedAt", "logFile", "errorMessage",
+        "threadId", "threadDir", "startedAt", "completedAt", "logFile", "errorMessage",
     }}
     jobs = _load_index(cwd)
     ts = now_iso()
@@ -234,14 +242,39 @@ def session_id() -> str | None:
     return os.environ.get(SESSION_ID_ENV)
 
 
+def _mark_cancelled(cwd: str, workspace: str, jid: str, message: str) -> None:
+    """Record a job as cancelled. Keeps threadId/threadDir so the opencode
+    session stays resumable after a clean broker abort."""
+    done = now_iso()
+    stored = read_job(workspace, jid) or {}
+    stored.update(status="cancelled", phase="cancelled", pid=None, opencodePid=None,
+                  completedAt=done, errorMessage=message)
+    write_job(workspace, jid, stored)
+    upsert_job(cwd, {"id": jid, "status": "cancelled", "phase": "cancelled",
+                     "pid": None, "opencodePid": None, "completedAt": done})
+
+
 def reap_session_jobs(cwd: str, sid: str) -> int:
-    """Kill active jobs for `sid` and drop them from the index. Returns the count reaped."""
+    """Cancel active jobs for Claude session `sid` and mark them cancelled.
+
+    Each running turn is stopped through the broker's abort API so opencode
+    flushes its state and the worker observes a clean cancellation (recorded
+    as cancelled, not failed). Jobs stay in the index for history/resume.
+    Falls back to a process-group SIGTERM only when the broker is unreachable."""
     if not cwd or not sid:
         return 0
     jobs = list_jobs(cwd)
-    reaped = 0
-    for j in jobs:
-        if j.get("sessionId") == sid and j["status"] in ("queued", "running"):
+    active = [j for j in jobs if j.get("sessionId") == sid and j["status"] in ("queued", "running")]
+    if not active:
+        return 0
+    broker = read_broker(cwd)
+    healthy = bool(broker and _pid_alive(broker.get("pid")) and broker_healthy(broker["url"], timeout=1))
+    for j in active:
+        tid = j.get("threadId")
+        via = None
+        if healthy and tid and broker_abort_session(broker, j.get("threadDir") or cwd, tid, timeout=1.5):
+            via = "broker abort"
+        else:
             kill_pid = j.get("opencodePid") or j.get("pid")
             if kill_pid:
                 try:
@@ -253,15 +286,217 @@ def reap_session_jobs(cwd: str, sid: str) -> int:
                         os.kill(kill_pid, signal.SIGTERM)
                     except Exception:
                         pass
-            reaped += 1
-    if reaped:
-        _save_index(cwd, [j for j in jobs if not (j.get("sessionId") == sid and j["status"] in ("queued", "running"))])
-    return reaped
+            via = "process stop"
+        append_log(cwd, j["id"], f"Claude session ended; job cancelled ({via}).")
+        _mark_cancelled(cwd, j.get("workspaceRoot") or cwd, j["id"], "Cancelled: Claude session ended.")
+    return len(active)
 
 
 def current_session_jobs(jobs: list[dict]) -> list[dict]:
     sid = session_id()
     return [j for j in jobs if not sid or j.get("sessionId") == sid]
+
+
+# --- opencode serve broker ---------------------------------------------------
+#
+# One persistent `opencode serve` broker per workspace. Tasks run as
+# `opencode run --attach <broker-url>` against pre-created sessions, and cancel
+# goes through POST /session/{id}/abort so opencode stops the turn itself,
+# flushes its SQLite state, and leaves the session idle + resumable.
+# The broker's lifecycle is tied to Claude sessions via lease files: the
+# SessionStart hook takes a lease, SessionEnd drops it, and the broker is
+# stopped when the last lease goes away.
+
+
+def _http_json(method: str, url: str, payload=None, timeout: float = 5):
+    """JSON HTTP call. Returns (ok, payload).
+
+    Guards against the opencode SPA fallback, which answers unknown API paths
+    with 200 text/html — a JSON content-type check is the only reliable signal."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if "application/json" not in (resp.headers.get("Content-Type") or ""):
+                return False, None
+            raw = resp.read().decode()
+            return True, (json.loads(raw) if raw.strip() else None)
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read().decode()
+            return False, (json.loads(raw) if raw.strip() else None)
+        except Exception:
+            return False, None
+    except Exception:
+        return False, None
+
+
+def _broker_paths(cwd: str) -> tuple[Path, Path, Path]:
+    d = state_dir(cwd)
+    return d / "broker.json", d / "broker.log", d / "broker.lock"
+
+
+def read_broker(cwd: str) -> dict | None:
+    f, _, _ = _broker_paths(cwd)
+    try:
+        b = json.loads(f.read_text())
+        return b if b.get("url") and b.get("pid") else None
+    except Exception:
+        return None
+
+
+def _pid_alive(pid) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def broker_healthy(url: str | None, timeout: float = 2) -> dict | None:
+    if not url:
+        return None
+    ok, payload = _http_json("GET", f"{url}/global/health", timeout=timeout)
+    return payload if ok and isinstance(payload, dict) and payload.get("healthy") else None
+
+
+def _parse_listen_url(log_file: Path) -> str | None:
+    try:
+        matches = re.findall(r"opencode server listening on (http://\S+)", log_file.read_text())
+    except Exception:
+        return None
+    return matches[-1] if matches else None
+
+
+def ensure_broker(cwd: str) -> dict | None:
+    """Return {'url', 'pid', ...} for the workspace broker, starting it if needed.
+
+    Serialized with a flock so concurrent task/worker spawns share one broker."""
+    bj, blog, block = _broker_paths(cwd)
+    state_dir(cwd).mkdir(parents=True, exist_ok=True)
+    with open(block, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        existing = read_broker(cwd)
+        if existing and _pid_alive(existing.get("pid")):
+            health = broker_healthy(existing["url"])
+            if health:
+                return {**existing, "version": health.get("version")}
+            # Alive but not answering: stop it before replacing.
+            try:
+                os.killpg(int(existing["pid"]), signal.SIGTERM)
+            except Exception:
+                pass
+            time.sleep(0.3)
+        binary = find_opencode_binary()
+        if not binary:
+            return None
+        workspace = workspace_root(cwd)
+        log_fh = open(blog, "wb")
+        try:
+            proc = subprocess.Popen(
+                [binary, "serve", "--port", "0", "--hostname", BROKER_HOSTNAME],
+                cwd=workspace, stdin=subprocess.DEVNULL, stdout=log_fh,
+                stderr=subprocess.STDOUT, start_new_session=True,
+            )
+        except FileNotFoundError:
+            log_fh.close()
+            return None
+        log_fh.close()  # the child holds its own dup of the fd
+        url = None
+        deadline = time.time() + BROKER_START_TIMEOUT_S
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            candidate = _parse_listen_url(blog)
+            if candidate and broker_healthy(candidate, timeout=1):
+                url = candidate
+                break
+            time.sleep(0.25)
+        if not url:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:
+                pass
+            return None
+        broker = {"url": url, "pid": proc.pid, "workspaceRoot": workspace, "startedAt": now_iso()}
+        bj.write_text(json.dumps(broker, indent=2) + "\n")
+        return broker
+
+
+def stop_broker(cwd: str) -> bool:
+    """SIGTERM the workspace broker (its own process group) and forget it."""
+    broker = read_broker(cwd)
+    bj, _, _ = _broker_paths(cwd)
+    stopped = False
+    if broker and _pid_alive(broker.get("pid")):
+        try:
+            os.killpg(int(broker["pid"]), signal.SIGTERM)
+            stopped = True
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                os.kill(int(broker["pid"]), signal.SIGTERM)
+                stopped = True
+            except Exception:
+                pass
+    try:
+        bj.unlink()
+    except Exception:
+        pass
+    return stopped
+
+
+def broker_create_session(broker: dict, directory: str, title: str | None = None) -> str | None:
+    q = urllib.parse.quote(str(directory), safe="")
+    ok, payload = _http_json("POST", f"{broker['url']}/session?directory={q}",
+                             {"title": title} if title else {}, timeout=10)
+    return payload.get("id") if ok and isinstance(payload, dict) else None
+
+
+def broker_abort_session(broker: dict | None, directory: str, sid: str | None, timeout: float = 3) -> bool:
+    if not broker or not sid:
+        return False
+    q = urllib.parse.quote(str(directory), safe="")
+    ok, payload = _http_json("POST", f"{broker['url']}/session/{sid}/abort?directory={q}", timeout=timeout)
+    return bool(ok and payload is True)
+
+
+def _leases_dir(cwd: str) -> Path:
+    d = state_dir(cwd) / "leases"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def lease_start(cwd: str, sid: str | None) -> None:
+    if not sid:
+        return
+    try:
+        (_leases_dir(cwd) / f"{sid}.json").write_text(
+            json.dumps({"sessionId": sid, "createdAt": now_iso()}) + "\n")
+    except Exception:
+        pass
+
+
+def lease_end(cwd: str, sid: str | None) -> int:
+    """Drop this Claude session's lease; return the number of leases remaining."""
+    if sid:
+        try:
+            (_leases_dir(cwd) / f"{sid}.json").unlink()
+        except Exception:
+            pass
+    return lease_count(cwd)
+
+
+def lease_count(cwd: str) -> int:
+    try:
+        return len(list(_leases_dir(cwd).glob("*.json")))
+    except Exception:
+        return 0
 
 
 # --- opencode task runner ----------------------------------------------------
@@ -279,18 +514,26 @@ def _describe_tool(part: dict) -> str:
     return f"Running tool: {name}{suffix}"
 
 
-def run_opencode_turn(cwd, prompt, model, variant, resume_id, on_text, on_progress, on_start=None):
-    """Spawn `opencode run --format json`, stream text, return (status, sid, raw, error).
+def run_opencode_turn(cwd, prompt, model, variant, session_id, is_resume, broker_url, on_text, on_progress, on_start=None):
+    """Run one opencode turn through the workspace broker.
 
-    `on_start(proc_pid)` is called right after the opencode process is spawned
-    so callers can record the opencode process-group leader for cancellation."""
+    Spawns `opencode run --attach <broker_url> --session <session_id>` so the
+    turn is owned by the persistent broker: cancellation goes through the
+    broker's abort API (clean turn stop, flushed state, idle + resumable
+    session) instead of killing the process. Returns a dict:
+      status (int), aborted (bool), sessionId, raw (str), error (str)
+
+    `on_start(proc_pid)` is called right after the opencode CLI is spawned so
+    callers can record the process-group leader as a last-resort stop path."""
     binary = find_opencode_binary()
     if not binary:
-        return 1, None, "", "opencode binary not found. Run /wh:setup to diagnose."
+        return {"status": 1, "aborted": False, "sessionId": session_id, "raw": "",
+                "error": "opencode binary not found. Run /wh:setup to diagnose."}
 
-    effective = prompt or (DEFAULT_CONTINUE_PROMPT if resume_id else "")
-    if not effective and not resume_id:
-        return 1, None, "", "Provide a prompt or use --resume."
+    effective = prompt or (DEFAULT_CONTINUE_PROMPT if is_resume else "")
+    if not effective:
+        return {"status": 1, "aborted": False, "sessionId": session_id, "raw": "",
+                "error": "Provide a prompt or use --resume."}
 
     args = [binary, "run"]
     if effective:
@@ -300,8 +543,10 @@ def run_opencode_turn(cwd, prompt, model, variant, resume_id, on_text, on_progre
         args += ["--model", model]
     if variant:
         args += ["--variant", variant]
-    if resume_id:
-        args += ["--session", resume_id]
+    if broker_url:
+        args += ["--attach", broker_url]
+    if session_id:
+        args += ["--session", session_id]
 
     try:
         proc = subprocess.Popen(
@@ -309,14 +554,16 @@ def run_opencode_turn(cwd, prompt, model, variant, resume_id, on_text, on_progre
             text=True, start_new_session=True,
         )
     except FileNotFoundError:
-        return 1, None, "", "opencode binary not found."
+        return {"status": 1, "aborted": False, "sessionId": session_id, "raw": "",
+                "error": "opencode binary not found."}
 
     if on_start:
         on_start(proc.pid)
 
-    sid = None
+    sid = session_id
     texts: list[str] = []
     failure = ""
+    aborted = False
 
     for line in proc.stdout:
         line = line.strip()
@@ -345,15 +592,21 @@ def run_opencode_turn(cwd, prompt, model, variant, resume_id, on_text, on_progre
         elif t == "error":
             e = ev.get("error") or {}
             msg = (e.get("data") or {}).get("message") or e.get("name") or "opencode error"
-            failure = f"{failure}\n{msg}" if failure else msg
-            on_progress(f"opencode error: {msg}", "failed")
+            if e.get("name") == ABORTED_ERROR:
+                # The turn was aborted through the broker (cancel / session end):
+                # a clean stop, not a failure.
+                aborted = True
+                on_progress("Turn aborted.", "cancelled")
+            else:
+                failure = f"{failure}\n{msg}" if failure else msg
+                on_progress(f"opencode error: {msg}", "failed")
 
     proc.wait()
     stderr = proc.stderr.read().strip()
     raw = "".join(texts)
     status = 1 if failure else proc.returncode
     error = failure or (stderr if status else "")
-    return status, sid, raw, error
+    return {"status": status, "aborted": aborted, "sessionId": sid, "raw": raw, "error": error}
 
 
 # --- task metadata / resume --------------------------------------------------
@@ -365,18 +618,17 @@ def task_metadata(prompt: str, resume: bool) -> dict:
     return {"title": title, "summary": summary}
 
 
-def resolve_resume_thread(workspace: str, exclude_job: str | None = None) -> str | None:
+def resolve_resume_candidate(workspace: str, exclude_job: str | None = None) -> dict | None:
     jobs = sorted(current_session_jobs(list_jobs(workspace)), key=lambda j: j.get("updatedAt", ""), reverse=True)
     if exclude_job:
         jobs = [j for j in jobs if j["id"] != exclude_job]
     active = next((j for j in jobs if j.get("jobClass") == "task" and j["status"] in ("queued", "running")), None)
     if active:
         die(f"Task {active['id']} is still running. Use /wh:status before continuing it.")
-    cand = next(
+    return next(
         (j for j in jobs if j.get("jobClass") == "task" and j.get("threadId") and j["status"] not in ("queued", "running")),
         None,
     )
-    return cand["threadId"] if cand else None
 
 
 # --- task command ------------------------------------------------------------
@@ -404,12 +656,34 @@ def _track_running(cwd: str, workspace: str, job: dict) -> None:
     upsert_job(cwd, job)
 
 
-def _finalize(cwd: str, workspace: str, job: dict, status: int, sid: str | None, raw: str, error: str) -> None:
-    done = "completed" if status == 0 else "failed"
-    job.update(status=done, phase=done, threadId=sid, pid=None, completedAt=now_iso(),
-               result={"status": status, "threadId": sid, "rawOutput": raw, "error": error})
-    write_job(workspace, job["id"], job)
+def _finalize(cwd: str, workspace: str, job: dict, result: dict) -> dict:
+    """Record the finished turn. Returns the stored result payload.
+
+    If /wh:cancel (or SessionEnd) already marked the job cancelled, that
+    verdict wins — the worker observed the same clean abort and must not
+    overwrite it with 'failed'."""
+    jid = job["id"]
+    stored = read_job(workspace, jid) or {}
+    if stored.get("status") == "cancelled":
+        if not stored.get("threadId") and result.get("sessionId"):
+            stored["threadId"] = result["sessionId"]
+            write_job(workspace, jid, stored)
+            upsert_job(cwd, {"id": jid, "threadId": result["sessionId"]})
+        job.update({k: v for k, v in stored.items() if k != "request"})
+        return stored.get("result") or {"status": result.get("status"), "threadId": stored.get("threadId"),
+                                        "rawOutput": result.get("raw", ""), "error": result.get("error", "")}
+    if result.get("aborted"):
+        done = "cancelled"
+    else:
+        done = "completed" if result.get("status") == 0 else "failed"
+    sid = result.get("sessionId") or job.get("threadId")
+    payload = {"status": result.get("status"), "threadId": sid,
+               "rawOutput": result.get("raw", ""), "error": result.get("error", "")}
+    job.update(status=done, phase=done, threadId=sid, pid=None, opencodePid=None, completedAt=now_iso(),
+               result=payload)
+    write_job(workspace, jid, job)
     upsert_job(cwd, job)
+    return payload
 
 
 def _progress_for(cwd: str, jid: str, workspace: str):
@@ -465,9 +739,22 @@ def cmd_task(argv) -> None:
             emit(f"{job['title']} started in the background as {job['id']}. Check /wh:status {job['id']} for progress.\n", False)
         return
 
-    resume_id = resolve_resume_thread(workspace) if args.resume else None
+    cand = resolve_resume_candidate(workspace) if args.resume else None
+    resume_id = cand["threadId"] if cand else None
     if not prompt and not resume_id:
         die("Provide a prompt, a prompt file, piped stdin, or use --resume/--resume-last.")
+
+    broker = ensure_broker(cwd)
+    if not broker:
+        die("Could not start the opencode broker (opencode serve). Run /wh:setup to diagnose.")
+    # Create the opencode session up front (unless resuming one) so the job
+    # carries its threadId from the start and cancel can abort immediately.
+    thread_id = resume_id or broker_create_session(broker, cwd, title=meta["summary"])
+    if not thread_id:
+        die("The opencode broker did not create a session. Run /wh:setup to diagnose.")
+    thread_dir = (cand or {}).get("threadDir") or cwd
+    job["threadId"] = thread_id
+    job["threadDir"] = thread_dir
 
     _track_running(cwd, workspace, job)
     progress = _progress_for(cwd, job["id"], workspace)
@@ -481,24 +768,50 @@ def cmd_task(argv) -> None:
     def on_start(proc_pid: int) -> None:
         upsert_job(cwd, {"id": job["id"], "opencodePid": proc_pid})
 
+    def _interrupted(signum, _frame) -> None:
+        # Claude Code kills the foreground companion on interrupt; stop the
+        # opencode turn through the broker instead of leaving it running.
+        broker_abort_session(broker, thread_dir, thread_id, timeout=2)
+        _mark_cancelled(cwd, workspace, job["id"], "Cancelled: interrupted.")
+        sys.exit(128 + int(signum))
+
+    signal.signal(signal.SIGTERM, _interrupted)
+    signal.signal(signal.SIGINT, _interrupted)
+
     try:
-        status, sid, raw, error = run_opencode_turn(cwd, prompt, model, args.variant, resume_id, on_text, progress, on_start)
+        result = run_opencode_turn(cwd, prompt, model, args.variant, thread_id, bool(resume_id),
+                                   broker["url"], on_text, progress, on_start)
     except Exception as e:
-        _finalize(cwd, workspace, job, 1, None, "", str(e))
+        broker_abort_session(broker, thread_dir, thread_id, timeout=2)
+        _finalize(cwd, workspace, job, {"status": 1, "aborted": False, "sessionId": thread_id, "raw": "", "error": str(e)})
         raise
-    _finalize(cwd, workspace, job, status, sid, raw, error)
+    payload = _finalize(cwd, workspace, job, result)
     if args.json:
-        print(json.dumps(job["result"], indent=2))
-    elif not raw:
-        emit((error or f"{job['title']} finished.") + "\n", False)
-    if status != 0:
-        sys.exit(status)
+        print(json.dumps(payload, indent=2))
+    elif not result["raw"]:
+        note = "Cancelled." if job.get("status") == "cancelled" else (result["error"] or f"{job['title']} finished.")
+        emit(note + "\n", False)
+    if result["status"] != 0 and not result["aborted"]:
+        sys.exit(result["status"])
 
 
 def _enqueue_background(cwd: str, workspace: str, job: dict, request: dict) -> None:
     append_log(cwd, job["id"], f"Starting {job['title']}.")
     append_log(cwd, job["id"], "Queued for background execution.")
     job.update(logFile=str(log_path(cwd, job["id"])), status="queued", phase="queued", request=request)
+
+    broker = ensure_broker(cwd)
+    if not broker:
+        die("Could not start the opencode broker (opencode serve). Run /wh:setup to diagnose.")
+    if not request.get("resume"):
+        # Pre-create the opencode session so a queued job already has a
+        # threadId and cancel never races session creation. Resume jobs pick
+        # their thread in the worker (latest state at start time).
+        thread_id = broker_create_session(broker, cwd, title=job.get("summary"))
+        if not thread_id:
+            die("The opencode broker did not create a session. Run /wh:setup to diagnose.")
+        job["threadId"] = thread_id
+        job["threadDir"] = cwd
 
     script = Path(__file__).resolve()
     runner = shutil.which("uv") or sys.executable
@@ -525,12 +838,54 @@ def cmd_task_worker(argv) -> None:
     stored = read_job(workspace, args.job_id)
     if not stored:
         die(f"No stored job found for {args.job_id}.")
+    if stored.get("status") == "cancelled":
+        return  # cancelled while still queued
     req = stored.get("request") or {}
-    resume_id = resolve_resume_thread(workspace, exclude_job=args.job_id) if req.get("resume") else None
 
-    stored.update(status="running", phase="starting", pid=os.getpid(), startedAt=now_iso(), logFile=str(log_path(cwd, args.job_id)))
+    broker = ensure_broker(cwd)
+    if not broker:
+        stored.update(status="failed", phase="failed", completedAt=now_iso(),
+                      errorMessage="opencode broker unavailable")
+        write_job(workspace, args.job_id, stored)
+        upsert_job(cwd, stored)
+        die("Could not start the opencode broker (opencode serve). Run /wh:setup to diagnose.")
+
+    cand = resolve_resume_candidate(workspace, exclude_job=args.job_id) if req.get("resume") else None
+    thread_id = (cand or {}).get("threadId") or stored.get("threadId")
+    thread_dir = (cand or {}).get("threadDir") or stored.get("threadDir") or cwd
+    if not thread_id:
+        # Resume requested but nothing to resume (or an old queued job without
+        # a pre-created session): start a fresh broker session.
+        thread_id = broker_create_session(broker, cwd, title=stored.get("summary"))
+        thread_dir = cwd
+        cand = None
+    if not thread_id:
+        stored.update(status="failed", phase="failed", completedAt=now_iso(),
+                      errorMessage="opencode broker did not create a session")
+        write_job(workspace, args.job_id, stored)
+        upsert_job(cwd, stored)
+        die("The opencode broker did not create a session. Run /wh:setup to diagnose.")
+
+    stored.update(status="running", phase="starting", pid=os.getpid(), threadId=thread_id,
+                  threadDir=thread_dir, startedAt=now_iso(), logFile=str(log_path(cwd, args.job_id)))
     write_job(workspace, args.job_id, stored)
     upsert_job(cwd, stored)
+
+    # A cancel may have landed while the worker was starting; honor it before
+    # spawning the turn.
+    if (read_job(workspace, args.job_id) or {}).get("status") == "cancelled":
+        if not cand:
+            broker_abort_session(broker, thread_dir, thread_id, timeout=2)
+        return
+
+    def _interrupted(signum, _frame) -> None:
+        broker_abort_session(broker, thread_dir, thread_id, timeout=2)
+        _mark_cancelled(cwd, workspace, args.job_id, "Cancelled: interrupted.")
+        sys.exit(128 + int(signum))
+
+    signal.signal(signal.SIGTERM, _interrupted)
+    signal.signal(signal.SIGINT, _interrupted)
+
     progress = _progress_for(cwd, args.job_id, workspace)
 
     def on_text(txt: str) -> None:
@@ -539,12 +894,9 @@ def cmd_task_worker(argv) -> None:
     def on_start(proc_pid: int) -> None:
         upsert_job(cwd, {"id": args.job_id, "opencodePid": proc_pid})
 
-    status, sid, raw, error = run_opencode_turn(cwd, req.get("prompt", ""), req.get("model"), req.get("variant"), resume_id, on_text, progress, on_start)
-    done = "completed" if status == 0 else "failed"
-    stored.update(status=done, phase=done, threadId=sid, pid=None, completedAt=now_iso(),
-                  result={"status": status, "threadId": sid, "rawOutput": raw, "error": error})
-    write_job(workspace, args.job_id, stored)
-    upsert_job(cwd, stored)
+    result = run_opencode_turn(cwd, req.get("prompt", ""), req.get("model"), req.get("variant"),
+                               thread_id, bool(cand), broker["url"], on_text, progress, on_start)
+    _finalize(cwd, workspace, stored, result)
 
 
 def cmd_task_resume_candidate(argv) -> None:
@@ -983,28 +1335,92 @@ def cmd_cancel(argv) -> None:
         die(str(e))
     if not job:
         die("No active opencode jobs to cancel.")
-    # Prefer the opencode process-group leader (set when opencode was spawned);
-    # fall back to the worker pid for jobs that never started opencode (queued).
-    kill_pid = job.get("opencodePid") or job.get("pid")
-    if kill_pid:
-        try:
-            os.killpg(kill_pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except Exception:
-            try:
-                os.kill(kill_pid, signal.SIGTERM)
-            except Exception:
-                pass
-    append_log(cwd, job["id"], "Cancelled by user.")
-    done = now_iso()
+    # Preferred path: abort the turn through the broker so opencode stops it
+    # itself — the session is flushed, marked idle, and stays resumable, and
+    # the worker records cancelled (not failed).
     stored = read_job(workspace, job["id"]) or {}
-    stored.update(status="cancelled", phase="cancelled", pid=None, completedAt=done, errorMessage="Cancelled by user.")
-    write_job(workspace, job["id"], stored)
-    upsert_job(cwd, {"id": job["id"], "status": "cancelled", "phase": "cancelled", "pid": None, "completedAt": done})
-    emit({"jobId": job["id"], "status": "cancelled", "title": job.get("title")}, args.json) if args.json else emit(
-        f"# Workhorse Delegate Cancel\n\nCancelled {job['id']}.\n\n- Check `/wh:status` for the updated queue.\n", False
+    thread_id = job.get("threadId") or stored.get("threadId")
+    thread_dir = job.get("threadDir") or stored.get("threadDir") or cwd
+    broker = read_broker(cwd)
+    aborted = False
+    if broker and thread_id and _pid_alive(broker.get("pid")) and broker_healthy(broker["url"], timeout=2):
+        aborted = broker_abort_session(broker, thread_dir, thread_id, timeout=3)
+    if aborted:
+        append_log(cwd, job["id"], "Turn aborted through the opencode broker.")
+        if not job.get("opencodePid"):
+            # The worker may still be setting up the turn (CLI not spawned yet
+            # at first abort). Abort once more after a short grace period to
+            # catch a turn that started just after the first abort.
+            time.sleep(2)
+            broker_abort_session(broker, thread_dir, thread_id, timeout=3)
+    else:
+        # Last resort (broker unreachable, or a queued job whose worker never
+        # started a turn): stop the process group directly.
+        kill_pid = job.get("opencodePid") or job.get("pid")
+        if kill_pid:
+            try:
+                os.killpg(kill_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                try:
+                    os.kill(kill_pid, signal.SIGTERM)
+                except Exception:
+                    pass
+        append_log(cwd, job["id"], "Cancelled by user (process stop; broker unavailable).")
+    append_log(cwd, job["id"], "Cancelled by user.")
+    _mark_cancelled(cwd, workspace, job["id"], "Cancelled by user.")
+    note = f"\n- The opencode session {thread_id} was stopped cleanly and can be resumed." if aborted and thread_id else ""
+    emit({"jobId": job["id"], "status": "cancelled", "title": job.get("title"), "aborted": aborted,
+          "threadId": thread_id}, args.json) if args.json else emit(
+        f"# Workhorse Delegate Cancel\n\nCancelled {job['id']}.{note}\n\n- Check `/wh:status` for the updated queue.\n", False
     )
+
+
+def cmd_broker(argv) -> None:
+    import argparse
+
+    p = argparse.ArgumentParser(prog="wh-companion broker", add_help=False)
+    p.add_argument("--stop", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--cwd")
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args(argv)
+    cwd = args.cwd or os.getcwd()
+
+    if args.stop:
+        remaining = lease_count(cwd)
+        if remaining and not args.force:
+            die(f"{remaining} Claude session(s) still hold a broker lease. Use --force to stop anyway.")
+        stopped = stop_broker(cwd)
+        emit({"stopped": stopped}, args.json) if args.json else emit(
+            "Broker stopped.\n" if stopped else "No running broker found.\n", False)
+        return
+
+    broker = read_broker(cwd)
+    health = broker_healthy(broker["url"]) if broker else None
+    _, blog, _ = _broker_paths(cwd)
+    payload = {
+        "running": bool(broker and health),
+        "url": broker.get("url") if broker else None,
+        "pid": broker.get("pid") if broker else None,
+        "startedAt": broker.get("startedAt") if broker else None,
+        "version": health.get("version") if health else None,
+        "leases": lease_count(cwd),
+        "logFile": str(blog),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        lines = ["# Workhorse Delegate Broker", ""]
+        if payload["running"]:
+            lines += [f"Status: running (opencode {payload.get('version') or 'unknown'})",
+                      f"URL: {payload['url']}", f"PID: {payload['pid']}",
+                      f"Started: {payload.get('startedAt')}", f"Active Claude session leases: {payload['leases']}",
+                      f"Log: {payload['logFile']}"]
+        else:
+            lines.append("Status: not running (starts on demand with the first task)")
+        emit("\n".join(lines) + "\n", False)
 
 
 # --- renderers ---------------------------------------------------------------
@@ -1087,6 +1503,7 @@ USAGE = """Usage:
   uv run wh-companion.py status [job-id] [--all] [--wait] [--timeout-ms <ms>] [--json]
   uv run wh-companion.py result [job-id] [--json]
   uv run wh-companion.py cancel [job-id] [--json]
+  uv run wh-companion.py broker [--stop [--force]] [--json]
 """
 
 HANDLERS = {
@@ -1098,6 +1515,7 @@ HANDLERS = {
     "status": cmd_status,
     "result": cmd_result,
     "cancel": cmd_cancel,
+    "broker": cmd_broker,
 }
 
 

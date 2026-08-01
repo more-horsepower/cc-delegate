@@ -113,8 +113,9 @@ wh proxy on --port 12345
 ## Why This Won't Break
 
 - **No CC internals** — only documented plugin components (agents, commands, hooks, skills, `${CLAUDE_PLUGIN_ROOT}`)
-- **No MCP server** — no running process to manage, no protocol version dependency
-- **Companion runtime** — a zero-dependency stdlib Python script (`wh-companion.py`) spawned via `uv run`; `opencode run` is the stable contract
+- **No MCP server** — no protocol version dependency
+- **Companion runtime** — a zero-dependency stdlib Python script (`wh-companion.py`) spawned via `uv run`; the `opencode run` CLI and `opencode serve` HTTP API are the stable contract
+- **Brokered execution** — tasks attach to one persistent `opencode serve` broker per workspace (started on demand, stopped when the last Claude session in the workspace ends). Cancellation calls the broker's session-abort API, so opencode stops turns itself: sessions flush cleanly, stay resumable, and cancelled jobs are never misrecorded as failed
 - **Output streams naturally** — the companion parses opencode's NDJSON event stream and forwards assistant `text` parts to stdout as they complete
 - **Tracked jobs** — every task is recorded so `/wh:status`, `/wh:result`, and `/wh:cancel` work, and `--resume` continues the prior opencode session
 - **Workhorse config managed by `wh opencode setup`** — the companion never touches endpoints, API keys, or model lists
